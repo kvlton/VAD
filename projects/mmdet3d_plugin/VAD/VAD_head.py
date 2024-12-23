@@ -553,14 +553,14 @@ class VADHead(DETRHead):
         bev_embed, hs, init_reference, inter_references, \
             map_hs, map_init_reference, map_inter_references = outputs
 
-        hs = hs.permute(0, 2, 1, 3)
+        hs = hs.permute(0, 2, 1, 3) # (6, B, 300, 256)
         outputs_classes = []
         outputs_coords = []
         outputs_coords_bev = []
         outputs_trajs = []
         outputs_trajs_classes = []
 
-        map_hs = map_hs.permute(0, 2, 1, 3)
+        map_hs = map_hs.permute(0, 2, 1, 3) # (6, B, 100*20, 256)
         map_outputs_classes = []
         map_outputs_coords = []
         map_outputs_pts_coords = []
@@ -657,12 +657,12 @@ class VADHead(DETRHead):
                     motion_coords, map_query, map_score, map_pos,
                     map_thresh=self.map_thresh, dis_thresh=self.dis_thresh,
                     pe_normalization=self.pe_normalization, use_fix_pad=True)
-                map_query = map_query.permute(1, 0, 2)  # [P, B*M, D]
-                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0)
+                map_query = map_query.permute(1, 0, 2)  # (m, B*300*6, 256), m<=100
+                ca_motion_query = motion_hs.permute(1, 0, 2).flatten(0, 1).unsqueeze(0) # (1, B*300*6, 256)
 
                 # position encoding
                 if self.use_pe:
-                    (num_query, batch) = ca_motion_query.shape[:2] 
+                    (num_query, batch) = ca_motion_query.shape[:2]
                     motion_pos = torch.zeros((num_query, batch, 2), device=motion_hs.device)
                     motion_pos = self.pos_mlp(motion_pos)
                     map_pos = map_pos.permute(1, 0, 2)
@@ -1735,12 +1735,12 @@ class VADHead(DETRHead):
 
     def select_and_pad_pred_map(
         self,
-        motion_pos,
-        map_query,
-        map_score,
-        map_pos,
+        motion_pos, # (B, 300*6, 2)
+        map_query,  # (B, 100, 256)
+        map_score,  # (B, 100, n)
+        map_pos,    # (B, 100, 20, 2)
         map_thresh=0.5,
-        dis_thresh=None,
+        dis_thresh=None, # 0.2
         pe_normalization=True,
         use_fix_pad=False
     ):
@@ -1773,10 +1773,10 @@ class VADHead(DETRHead):
         # select & pad map vectors for different batch using map_thresh
         map_score = map_score.sigmoid()
         map_max_score = map_score.max(dim=-1)[0]
-        map_idx = map_max_score > map_thresh
+        map_idx = map_max_score > map_thresh # (B, 100)
         batch_max_pnum = 0
         for i in range(map_score.shape[0]):
-            pnum = map_idx[i].sum()
+            pnum = map_idx[i].sum() # 当前batch，有效的车道线数量
             if pnum > batch_max_pnum:
                 batch_max_pnum = pnum
 
@@ -1784,8 +1784,8 @@ class VADHead(DETRHead):
         for i in range(map_score.shape[0]):
             dim = map_query.shape[-1]
             valid_pnum = map_idx[i].sum()
-            valid_map_query = map_query[i, map_idx[i]]
-            valid_map_pos = min_map_pos[i, map_idx[i]]
+            valid_map_query = map_query[i, map_idx[i]] # (m, 256)
+            valid_map_pos = min_map_pos[i, map_idx[i]] # (m, 2)
             pad_pnum = batch_max_pnum - valid_pnum
             padding_mask = torch.tensor([False], device=map_score.device).repeat(batch_max_pnum)
             if pad_pnum != 0:
@@ -1796,29 +1796,29 @@ class VADHead(DETRHead):
             selected_map_pos.append(valid_map_pos)
             selected_padding_mask.append(padding_mask)
 
-        selected_map_query = torch.stack(selected_map_query, dim=0)
-        selected_map_pos = torch.stack(selected_map_pos, dim=0)
+        selected_map_query = torch.stack(selected_map_query, dim=0)       # (B, m, 256)
+        selected_map_pos = torch.stack(selected_map_pos, dim=0)           # (B, m, 2)
         selected_padding_mask = torch.stack(selected_padding_mask, dim=0)
 
         # generate different pe for map vectors for each agent
         num_agent = motion_pos.shape[1]
-        selected_map_query = selected_map_query.unsqueeze(1).repeat(1, num_agent, 1, 1)  # [B, A, max_P, D]
-        selected_map_pos = selected_map_pos.unsqueeze(1).repeat(1, num_agent, 1, 1)  # [B, A, max_P, 2]
-        selected_padding_mask = selected_padding_mask.unsqueeze(1).repeat(1, num_agent, 1)  # [B, A, max_P]
+        selected_map_query = selected_map_query.unsqueeze(1).repeat(1, num_agent, 1, 1)    # [B, 300*6, m, 256]
+        selected_map_pos = selected_map_pos.unsqueeze(1).repeat(1, num_agent, 1, 1)        # [B, 300*6, m, 2]
+        selected_padding_mask = selected_padding_mask.unsqueeze(1).repeat(1, num_agent, 1) # [B, 300*6, m]
         # move lane to per-car coords system
-        selected_map_dist = selected_map_pos - motion_pos[:, :, None, :]  # [B, A, max_P, 2]
+        selected_map_dist = selected_map_pos - motion_pos[:, :, None, :]     # [B, 300*6, m, 2]
         if pe_normalization:
-            selected_map_pos = selected_map_pos - motion_pos[:, :, None, :]  # [B, A, max_P, 2]
+            selected_map_pos = selected_map_pos - motion_pos[:, :, None, :]  # [B, 300*6, m, 2]
 
         # filter far map inst for each agent
-        map_dis = torch.sqrt(selected_map_dist[..., 0]**2 + selected_map_dist[..., 1]**2)
-        valid_map_inst = (map_dis <= dis_thresh)  # [B, A, max_P]
+        map_dis = torch.sqrt(selected_map_dist[..., 0]**2 + selected_map_dist[..., 1]**2) # [B, 300*6, m]
+        valid_map_inst = (map_dis <= dis_thresh)  # [B, 300*6, m]
         invalid_map_inst = (valid_map_inst == False)
         selected_padding_mask = selected_padding_mask + invalid_map_inst
 
-        selected_map_query = selected_map_query.flatten(0, 1)
-        selected_map_pos = selected_map_pos.flatten(0, 1)
-        selected_padding_mask = selected_padding_mask.flatten(0, 1)
+        selected_map_query = selected_map_query.flatten(0, 1)       # [B*300*6, m, 256]
+        selected_map_pos = selected_map_pos.flatten(0, 1)           # [B*300*6, m, 2]
+        selected_padding_mask = selected_padding_mask.flatten(0, 1) # [B*300*6, m]
 
         num_batch = selected_padding_mask.shape[0]
         feat_dim = selected_map_query.shape[-1]
